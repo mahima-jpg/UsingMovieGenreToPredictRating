@@ -270,6 +270,30 @@ plt.savefig(img_dir / "genre_avg_rating.png")
 plt.show()
 plt.close()
 
+#Create a binary label which is 1 if the movie's average rating is at least 4.0 if not it is 0
+df["high_rating"] = (df["avg_rating"] >= 4.0).astype(int)
+
+genre_dummies = df["genres"].str.get_dummies(sep="|")
+
+import numpy as np
+
+#Build the matrix
+X = pd.concat([df[["year", "num_ratings"]], genre_dummies], axis=1)
+y = df["high_rating"].values
+
+#Train on older movies (< 2015) and test on newer ones (>= 2015)
+train = df["year"] < 2015
+test = df["year"] >= 2015
+X_train, X_test = X[train], X[test]
+y_train, y_test = y[train], y[test]
+
+print("X_train shape:", X_train.shape)
+print("X_test shape:", X_test.shape)
+print("y_train shape:", y_train.shape)
+print("y_test shape:", y_test.shape)
+print("Train high_rating rate:", y_train.mean())
+print("Test high_rating rate:", y_test.mean())
+
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 
@@ -278,7 +302,7 @@ model.fit(X_train, y_train)
 
 y_pred = model.predict(X_test)
 print("Accuracy:", accuracy_score(y_test, y_pred))
-print("F1:",       f1_score(y_test, y_pred))
+print("F1:", f1_score(y_test, y_pred))
 
 import matplotlib.pyplot as plt
 
@@ -354,53 +378,210 @@ for i, row in enumerate(data_sorted[:10], 1):
     print(f"{i}. {row['title']} — Popularity Score: {row['popularity_score']:.2f}")
 
 
-#Filip maybe something like this for the predicition UI - got it from chatgpt so please double check
-# -------------------------------
-# 5. Very simple text-based "UI" for prediction
-# -------------------------------
+# Movie Similarity Engine (using cosine similarity)
 
-def predict_movie_interactive(model, feature_columns):
-    """
-    Simple text-based UI:
-    asks for year, num_ratings, and genres,
-    then prints the predicted probability and label.
-    """
-    print("=== Movie Rating Predictor ===")
-    title = input("Movie title (optional, for display only): ")
+from sklearn.metrics.pairwise import cosine_similarity
 
-    year = int(input("Year (e.g. 2010): "))
-    num_ratings = int(input("Number of ratings (e.g. 1500): "))
+movie_vectors = X  
+similarity = cosine_similarity(movie_vectors)
 
-    genres_input = input("Genres separated by | (e.g. Action|Sci-Fi): ")
-    genres_list = [g.strip() for g in genres_input.split("|") if g.strip()]
+def recommend_movie(movie_id, k=5):
+    if movie_id not in df_clean["movieId"].values:
+        print("Invalid movieId")
+        return
 
-    # Start with a row of zeros for all feature columns
-    row = {col: 0 for col in feature_columns}
+    idx = df_clean.index[df_clean["movieId"] == movie_id][0]
+    sim_scores = list(enumerate(similarity[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:k+1]
 
-    # Set numeric features
-    if "year" in row:
-        row["year"] = year
-    if "num_ratings" in row:
-        row["num_ratings"] = num_ratings
+    print(f"\nMovies similar to: {df_clean.loc[idx, 'title']}\n")
+    for i, score in sim_scores:
+        print(f"{df_clean.loc[i, 'title']} (score={score:.3f})")
 
-    # Set genre indicator columns to 1 if they are selected
-    for g in genres_list:
+
+
+#Multi Page UI
+
+import streamlit as st
+import pandas as pd
+import sqlite3
+import joblib
+from sklearn.metrics.pairwise import cosine_similarity
+import openai   
+import os
+
+conn = sqlite3.connect("movie_ratings.db")
+
+df = pd.read_sql_query("""
+    SELECT movieId, title, genres, year, num_ratings, avg_rating, high_rating
+    FROM MovieRatingsClean
+""", conn)
+
+X_columns = joblib.load("x_columns.pkl")
+model = joblib.load("model.pkl")
+
+genre_dummies = df["genres"].str.get_dummies(sep="|")
+X = pd.concat([df[["year", "num_ratings"]], genre_dummies], axis=1)
+
+similarity = cosine_similarity(X)
+df = df.reset_index(drop=True)
+
+st.title("Movie Data Science Hub")
+
+page = st.sidebar.selectbox("Navigation", [
+    "High Rating Predictor",
+    "Movie Recommender",
+    "Genre Statistics",
+    "SQL Explorer",
+    "Ask an LLM About Your Movie",
+    "Model Performance"
+])
+
+if page == "High Rating Predictor":
+    st.header("Predict Whether a Movie Will Be Highly Rated")
+
+    year = st.number_input("Release Year", 1980, 2025, 2005)
+    num_ratings = st.number_input("Number of Ratings", 0, 500000, 500)
+
+    genres = list(genre_dummies.columns)
+    selected = st.multiselect("Genres", genres)
+
+    row = {col: 0 for col in X_columns}
+    row["year"] = year
+    row["num_ratings"] = num_ratings
+
+    for g in selected:
         if g in row:
             row[g] = 1
 
-    # Build DataFrame with the same columns as X
-    X_new = pd.DataFrame([row], columns=feature_columns)
+    row_df = pd.DataFrame([row])
 
-    # Predict probability and label
-    prob_high = model.predict_proba(X_new)[0, 1]
-    label = int(prob_high >= 0.5)
+    if st.button("Predict"):
+        prob = model.predict_proba(row_df)[0, 1]
+        label = "Highly Rated" if prob >= 0.5 else "Not Highly Rated"
+        st.subheader(label)
+        st.write("Probability:", round(prob, 3))
 
-    print("\nPrediction for:", title or "(untitled movie)")
-    print("  Estimated probability of high rating (avg >= 4.0):", round(prob_high, 3))
-    print("  Predicted label (1 = high-rated, 0 = not):", label)
-    print()
+elif page == "Movie Recommender":
+    st.header("Find Similar Movies")
+
+    movie_names = df["title"].tolist()
+    choice = st.selectbox("Select a Movie", movie_names)
+
+    if st.button("Recommend"):
+        idx = df.index[df["title"] == choice][0]
+        sims = list(enumerate(similarity[idx]))
+        sims = sorted(sims, key=lambda x: x[1], reverse=True)[1:6]
+
+        st.subheader("Similar Movies:")
+        for i, s in sims:
+            st.write(f"{df.loc[i, 'title']} — similarity: {s:.3f}")
+
+elif page == "Genre Statistics":
+    st.header("Genre Rating Statistics")
+
+    genre_summary = pd.read_sql_query("""
+        SELECT genre, n_movies, avg_movie_rating, share_high_rating
+        FROM MovieGenreSummary
+        ORDER BY avg_movie_rating DESC
+    """, conn)
+
+    st.dataframe(genre_summary)
+
+    st.bar_chart(
+        genre_summary.set_index("genre")["avg_movie_rating"]
+    )
+
+elif page == "SQL Explorer":
+    st.header("Run SQL on the Movie Database")
+
+    user_sql = st.text_area("Write SQL here:", "SELECT * FROM MovieRatingsClean LIMIT 10;")
+
+    if st.button("Execute"):
+        try:
+            result = pd.read_sql_query(user_sql, conn)
+            st.dataframe(result)
+        except Exception as e:
+            st.error(f"SQL Error: {e}")
+
+elif page == "Ask an LLM About Your Movie":
+    st.header("LLM Movie Summary & Insights")
+
+    openai.api_key = st.text_input("Enter OpenAI API Key:", type="password")
+
+    selected_movie = st.selectbox("Choose a movie:", df["title"])
+
+    prompt = f"""
+    Provide a thoughtful analysis for the movie "{selected_movie}" based on:
+    - Title
+    - Genres
+    - Release year
+    - Average rating
+    - Number of ratings
+    Generate:
+    • A short summary  
+    • What type of audience might like it  
+    • Whether it is likely high-rated or not based on metadata  
+    """
+
+    if st.button("Generate LLM Summary"):
+        if not openai.api_key:
+            st.error("API key required")
+        else:
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                st.write(response["choices"][0]["message"]["content"])
+            except Exception as e:
+                st.error(str(e))
+elif page == "Model Performance":
+    st.header("Model Evaluation: F1 Score, Accuracy & Diagnostics")
+
+    st.write("This evaluates the logistic regression model that predicts whether a movie achieves a high rating (≥ 4.0).")
+    df_perf = df.copy()
+
+    genre_dummies_perf = df_perf["genres"].str.get_dummies(sep="|")
+    X_perf = pd.concat([df_perf[["year", "num_ratings"]], genre_dummies_perf], axis=1)
+    y_perf = df_perf["high_rating"].astype(int).values
+
+    train_mask = df_perf["year"] < 2015
+    test_mask = df_perf["year"] >= 2015
+
+    X_train_perf = X_perf[train_mask]
+    X_test_perf = X_perf[test_mask]
+    y_train_perf = y_perf[train_mask]
+    y_test_perf = y_perf[test_mask]
+
+    y_pred_perf = model.predict(X_test_perf)
 
 
-# Call this once if you want to try the UI in the terminal / console
-# (You can comment this out when you don't want to interact.)
-predict_movie_interactive(model, X.columns.tolist())
+    acc = accuracy_score(y_test_perf, y_pred_perf)
+    f1 = f1_score(y_test_perf, y_pred_perf)
+
+    st.subheader("Performance Metrics:")
+    st.write(f"**Accuracy:** {acc:.3f}")
+    st.write(f"**F1 Score:** {f1:.3f}")
+
+    from sklearn.metrics import classification_report, confusion_matrix
+    report = classification_report(y_test_perf, y_pred_perf, output_dict=True)
+
+    st.subheader("Classification Report:")
+    st.json(report)
+
+    cm = confusion_matrix(y_test_perf, y_pred_perf)
+
+    st.subheader("Confusion Matrix:")
+    st.write(cm)
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    fig, ax = plt.subplots()
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+    ax.set_xlabel("Predicted Label")
+    ax.set_ylabel("True Label")
+    ax.set_title("Confusion Matrix Heatmap")
+
+    st.pyplot(fig)
